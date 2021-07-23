@@ -30,6 +30,8 @@ function munge_ceph_spec_in {
     shift
     local for_make_check=$1
     shift
+    local with_jaeger=$1
+    shift
     local OUTFILE=$1
     sed -e 's/@//g' < ceph.spec.in > $OUTFILE
     # http://rpm.org/user_doc/conditional_builds.html
@@ -50,10 +52,6 @@ function munge_ceph_spec_in {
 function munge_debian_control {
     local version=$1
     shift
-    local with_seastar=$1
-    shift
-    local for_make_check=$1
-    shift
     local control=$1
     case "$version" in
         *squeeze*|*wheezy*)
@@ -61,15 +59,9 @@ function munge_debian_control {
 	    grep -v babeltrace debian/control > $control
 	    ;;
     esac
-    if $with_seastar; then
-	sed -i -e 's/^# Crimson[[:space:]]//g' $control
-    fi
     if $with_jaeger; then
 	sed -i -e 's/^# Jaeger[[:space:]]//g' $control
 	sed -i -e 's/^# Crimson      libyaml-cpp-dev,/d' $control
-    fi
-    if $for_make_check; then
-        sed -i 's/^# Make-Check[[:space:]]/             /g' $control
     fi
     echo $control
 }
@@ -174,13 +166,21 @@ function install_pkg_on_ubuntu {
 }
 
 function install_boost_on_ubuntu {
-    local codename=$1
-    if apt -qq list ceph-libboost1.72-dev 2>/dev/null | grep -q installed; then
-	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove 'ceph-libboost.*1.72.*'
-	$SUDO rm -f /etc/apt/sources.list.d/ceph-libboost1.72.list
+    local ver=1.75
+    local installed_ver=$(apt -qq list --installed ceph-libboost*-dev 2>/dev/null |
+                              grep -e 'libboost[0-9].[0-9]\+-dev' |
+                              cut -d' ' -f2 |
+                              cut -d'.' -f1,2)
+    if test -n "$installed_ver"; then
+        if echo "$installed_ver" | grep -q "^$ver"; then
+            return
+        else
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove "ceph-libboost.*${installed_ver}.*"
+            $SUDO rm -f /etc/apt/sources.list.d/ceph-libboost${installed_ver}.list
+        fi
     fi
+    local codename=$1
     local project=libboost
-    local ver=1.73
     local sha1=7aba8a1882670522ee1d1ee1bba0ea170b292dec
     install_pkg_on_ubuntu \
 	$project \
@@ -215,6 +215,19 @@ function install_libzbd_on_ubuntu {
         $codename \
         check \
         libzbd-dev
+}
+
+function install_libpmem_on_ubuntu {
+    local codename=$1
+    local project=pmem
+    local sha1=7c18b4b1413ae965ea8bcbfc69eb9784f9212319
+    install_pkg_on_ubuntu \
+        $project \
+        $sha1 \
+        $codename \
+        check \
+        libpmem-dev \
+        libpmemobj-dev
 }
 
 function version_lt {
@@ -273,6 +286,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
         devel/py-argparse \
         devel/py-nose \
         devel/py-prettytable \
+        devel/py-yaml \
         www/py-routes \
         www/py-flask \
         www/node \
@@ -292,13 +306,11 @@ else
     [ $WITH_SEASTAR ] && with_seastar=true || with_seastar=false
     [ $WITH_JAEGER ] && with_jaeger=true || with_jaeger=false
     [ $WITH_ZBD ] && with_zbd=true || with_zbd=false
+    [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
     source /etc/os-release
     case "$ID" in
-    debian|ubuntu|devuan|elementary)
+    debian|ubuntu|devuan|elementary|softiron)
         echo "Using apt-get to install dependencies"
-        $SUDO apt install -y docker.io
-        $SUDO systemctl start docker
-        $SUDO systemctl enable docker
         $SUDO apt-get install -y devscripts equivs
         $SUDO apt-get install -y dpkg-dev
         ensure_python3_sphinx_on_ubuntu
@@ -307,6 +319,11 @@ else
                 ensure_decent_gcc_on_ubuntu 9 bionic
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu bionic
                 $with_zbd && install_libzbd_on_ubuntu bionic
+                ;;
+            *Focal*)
+                [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu focal
+                $with_zbd && install_libzbd_on_ubuntu focal
+                $with_pmem && install_libpmem_on_ubuntu focal
                 ;;
             *)
                 $SUDO apt-get install -y gcc
@@ -319,7 +336,7 @@ else
         touch $DIR/status
 
 	backports=""
-	control=$(munge_debian_control "$VERSION" "$with_seastar" "$for_make_check" "debian/control")
+	control=$(munge_debian_control "$VERSION" "debian/control")
         case "$VERSION" in
             *squeeze*|*wheezy*)
                 backports="-t $codename-backports"
@@ -329,7 +346,20 @@ else
 	# make a metapackage that expresses the build dependencies,
 	# install it, rm the .deb; then uninstall the package as its
 	# work is done
-	$SUDO env DEBIAN_FRONTEND=noninteractive mk-build-deps --install --remove --tool="apt-get -y --no-install-recommends $backports" $control || exit 1
+	build_profiles=""
+	if $for_make_check; then
+	    build_profiles+=",pkg.ceph.check"
+	fi
+	if $with_seastar; then
+	    build_profiles+=",pkg.ceph.crimson"
+	fi
+	if $with_jaeger; then
+	    build_profiles+=",pkg.ceph.jaeger"
+	fi
+	$SUDO env DEBIAN_FRONTEND=noninteractive mk-build-deps \
+	      --build-profiles "${build_profiles#,}" \
+	      --install --remove \
+	      --tool="apt-get -y --no-install-recommends $backports" $control || exit 1
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove ceph-build-deps
 	if [ "$control" != "debian/control" ] ; then rm $control; fi
         ;;
@@ -339,9 +369,6 @@ else
         case "$ID" in
             fedora)
                 $SUDO dnf install -y dnf-utils
-                $SUDO dnf install -y docker-ce docker-ce-cli containerd.io
-                $SUDO systemctl start docker
-                $SUDO systemctl enable docker
                 ;;
             centos|rhel|ol|virtuozzo)
                 MAJOR_VERSION="$(echo $VERSION_ID | cut -d. -f1)"
@@ -357,13 +384,13 @@ else
                     $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
                     $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
                 elif test $ID = rhel -a $MAJOR_VERSION = 8 ; then
-                    $SUDO subscription-manager repos --enable "codeready-builder-for-rhel-8-${ARCH}-rpms"
+                    $SUDO dnf config-manager --set-enabled "codeready-builder-for-rhel-8-${ARCH}-rpms"
 		    $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
 		    $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
                 fi
                 ;;
         esac
-        munge_ceph_spec_in $with_seastar $with_zbd $for_make_check $DIR/ceph.spec
+        munge_ceph_spec_in $with_seastar $with_zbd $for_make_check $with_jaeger $DIR/ceph.spec
         # for python3_pkgversion macro defined by python-srpm-macros, which is required by python3-devel
         $SUDO dnf install -y python3-devel
         $SUDO $builddepcmd $DIR/ceph.spec 2>&1 | tee $DIR/yum-builddep.out
@@ -375,7 +402,7 @@ else
         echo "Using zypper to install dependencies"
         zypp_install="zypper --gpg-auto-import-keys --non-interactive install --no-recommends"
         $SUDO $zypp_install systemd-rpm-macros rpm-build || exit 1
-        munge_ceph_spec_in $with_seastar false $for_make_check $DIR/ceph.spec
+        munge_ceph_spec_in $with_seastar false $for_make_check $with_jaeger $DIR/ceph.spec
         $SUDO $zypp_install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
     *)
@@ -436,7 +463,6 @@ function preload_wheels_for_tox() {
         mv $wip_wheelhouse wheelhouse
         md5sum $require_files $constraint_files > $md5
     fi
-
     popd > /dev/null
 }
 
